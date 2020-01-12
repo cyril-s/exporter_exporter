@@ -14,60 +14,58 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"strconv"
 	"strings"
 
-	"golang.org/x/net/context/ctxhttp"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/log"
 )
 
-func (c httpConfig) GatherWithContext(ctx context.Context, r *http.Request) prometheus.GathererFunc {
-	return func() ([]*dto.MetricFamily, error) {
-		qvs := r.URL.Query()
-		qvs["module"] = qvs["module"][1:]
+func (cfg moduleConfig) getReverseProxyDirectorFunc() func(*http.Request) {
+	return func(r *http.Request) {
+		vs := r.URL.Query()
+		vs["module"] = vs["module"][1:]
+		r.URL.RawQuery = vs.Encode()
 
-		url, err := url.Parse(c.Path)
-		uvs := url.Query()
-		for k, vs := range uvs {
-			for _, v := range vs {
-				qvs.Add(k, v)
-			}
-		}
+		r.URL.Scheme = cfg.HTTP.Scheme
+		r.URL.Host = net.JoinHostPort(cfg.HTTP.Address, strconv.Itoa(cfg.HTTP.Port))
+		r.URL.Path = cfg.HTTP.Path
+	}
+}
 
-		url.Host = net.JoinHostPort(c.Address, strconv.Itoa(c.Port))
-		url.Scheme = c.Scheme
-		url.RawQuery = qvs.Encode()
-
-		resp, err := ctxhttp.Get(ctx, c.httpClient, url.String())
-		if err != nil {
-			log.Errorf("http proxy for module %v failed %+v", c.mcfg.name, err)
-			proxyErrorCount.WithLabelValues(c.mcfg.name).Inc()
-			if err == context.DeadlineExceeded {
-				proxyTimeoutCount.WithLabelValues(c.mcfg.name).Inc()
-			}
-			return nil, err
-		}
-		defer resp.Body.Close()
-
+func (cfg moduleConfig) getReverseProxyModifyResponseFunc() func(*http.Response) error {
+	return func(resp *http.Response) error {
 		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("server responded %v, %q", resp.StatusCode, resp.Status)
+			return nil
 		}
 
-		dec := expfmt.NewDecoder(resp.Body, expfmt.ResponseFormat(resp.Header))
+		var (
+			err  error
+			body bytes.Buffer
+		)
 
-		result := []*dto.MetricFamily{}
+		if _, err = body.ReadFrom(resp.Body); err != nil {
+			return fmt.Errorf("Failed to read body from proxied server: %w", err)
+		}
+		resp.Body = ioutil.NopCloser(bytes.NewReader(body.Bytes()))
+
+		var bodyReader io.Reader = bytes.NewReader(body.Bytes())
+		if resp.Header.Get("Content-Encoding") == "gzip" {
+			bodyReader, err = gzip.NewReader(bodyReader)
+			if err != nil {
+				return fmt.Errorf("Failed to decode gzipped response: %w", err)
+			}
+		}
+
+		dec := expfmt.NewDecoder(bodyReader, expfmt.ResponseFormat(resp.Header))
 		for {
 			mf := dto.MetricFamily{}
 			err := dec.Decode(&mf)
@@ -75,49 +73,14 @@ func (c httpConfig) GatherWithContext(ctx context.Context, r *http.Request) prom
 				break
 			}
 			if err != nil {
-				proxyMalformedCount.WithLabelValues(c.mcfg.name).Inc()
+				proxyMalformedCount.WithLabelValues(cfg.name).Inc()
 				log.Errorf("err %+v", err)
-				return nil, err
+				return err
 			}
-
-			result = append(result, &mf)
 		}
 
-		return result, nil
+		return nil
 	}
-}
-
-func (c httpConfig) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var h http.Handler
-
-	if !(*c.Verify) {
-		// proxy directly
-		rt := &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout: c.mcfg.Timeout,
-			}).Dial,
-			TLSHandshakeTimeout: c.mcfg.Timeout,
-			TLSClientConfig:     c.tlsConfig,
-		}
-		h = &httputil.ReverseProxy{
-			Transport: rt,
-			Director: func(r *http.Request) {
-				vs := r.URL.Query()
-				vs["module"] = vs["module"][1:]
-				r.URL.RawQuery = vs.Encode()
-
-				r.URL.Scheme = c.Scheme
-				r.URL.Host = net.JoinHostPort(c.Address, strconv.Itoa(c.Port))
-				r.URL.Path = c.Path
-			},
-		}
-	} else {
-		ctx := r.Context()
-		g := c.GatherWithContext(ctx, r)
-		h = promhttp.HandlerFor(g, promhttp.HandlerOpts{})
-	}
-
-	h.ServeHTTP(w, r)
 }
 
 // BearerAuthMiddleware
