@@ -16,7 +16,8 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
-	"fmt"
+	"context"
+	"errors"
 	"io"
 	"io/ioutil"
 	"net"
@@ -28,6 +29,22 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/log"
 )
+
+const (
+	// Msg to send in response body when verification of proxied server
+	// response is failed
+	VerificationErrorMsg = "Internal Server Error: " +
+		"Response from proxied server failed verification. " +
+		"See server logs for details"
+)
+
+type VerifyError struct {
+	msg   string
+	cause error
+}
+
+func (e *VerifyError) Error() string { return e.msg + ": " + e.cause.Error() }
+func (e *VerifyError) Unwrap() error { return e.cause }
 
 func (cfg moduleConfig) getReverseProxyDirectorFunc() func(*http.Request) {
 	return func(r *http.Request) {
@@ -53,7 +70,7 @@ func (cfg moduleConfig) getReverseProxyModifyResponseFunc() func(*http.Response)
 		)
 
 		if _, err = body.ReadFrom(resp.Body); err != nil {
-			return fmt.Errorf("Failed to read body from proxied server: %w", err)
+			return &VerifyError{"Failed to read body from proxied server", err}
 		}
 		resp.Body = ioutil.NopCloser(bytes.NewReader(body.Bytes()))
 
@@ -61,7 +78,7 @@ func (cfg moduleConfig) getReverseProxyModifyResponseFunc() func(*http.Response)
 		if resp.Header.Get("Content-Encoding") == "gzip" {
 			bodyReader, err = gzip.NewReader(bodyReader)
 			if err != nil {
-				return fmt.Errorf("Failed to decode gzipped response: %w", err)
+				return &VerifyError{"Failed to decode gzipped response", err}
 			}
 		}
 
@@ -74,12 +91,31 @@ func (cfg moduleConfig) getReverseProxyModifyResponseFunc() func(*http.Response)
 			}
 			if err != nil {
 				proxyMalformedCount.WithLabelValues(cfg.name).Inc()
-				log.Errorf("err %+v", err)
-				return err
+				return &VerifyError{"Failed to decode metrics from proxied server", err}
 			}
 		}
 
 		return nil
+	}
+}
+
+func (cfg moduleConfig) getReverseProxyErrorHandlerFunc() func(http.ResponseWriter, *http.Request, error) {
+	return func(w http.ResponseWriter, r *http.Request, err error) {
+		var verifyError *VerifyError
+		if errors.As(err, &verifyError) {
+			log.Errorf("Verification for module '%s' failed: %v", cfg.name, err)
+			http.Error(w, VerificationErrorMsg, http.StatusInternalServerError)
+			return
+		}
+
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Errorf("Request time out for module '%s'", cfg.name)
+			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
+			return
+		}
+
+		log.Errorf("Proxy error for module '%s': %v", cfg.name, err)
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 	}
 }
 

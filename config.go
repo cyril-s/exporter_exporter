@@ -117,6 +117,8 @@ func checkModuleConfig(name string, cfg *moduleConfig) error {
 		return fmt.Errorf("unknown module configuration fields: %v", cfg.XXX)
 	}
 
+	cfg.name = name
+
 	switch cfg.Method {
 	case "http":
 		if len(cfg.HTTP.XXX) != 0 {
@@ -146,8 +148,9 @@ func checkModuleConfig(name string, cfg *moduleConfig) error {
 		}
 		cfg.HTTP.tlsConfig = tlsConfig
 		cfg.HTTP.ReverseProxy = &httputil.ReverseProxy{
-			Transport: &http.Transport{TLSClientConfig: tlsConfig},
-			Director:  cfg.getReverseProxyDirectorFunc(),
+			Transport:    &http.Transport{TLSClientConfig: tlsConfig},
+			Director:     cfg.getReverseProxyDirectorFunc(),
+			ErrorHandler: cfg.getReverseProxyErrorHandlerFunc(),
 		}
 		if *cfg.HTTP.Verify {
 			cfg.HTTP.ReverseProxy.ModifyResponse = cfg.getReverseProxyModifyResponseFunc()
