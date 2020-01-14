@@ -14,7 +14,6 @@
 package main
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -46,6 +45,16 @@ type VerifyError struct {
 func (e *VerifyError) Error() string { return e.msg + ": " + e.cause.Error() }
 func (e *VerifyError) Unwrap() error { return e.cause }
 
+type nopWriteCloser struct {
+	io.Writer
+}
+
+func (nopWriteCloser) Close() error { return nil }
+
+func NopWriteCloser(w io.Writer) io.WriteCloser {
+	return nopWriteCloser{w}
+}
+
 func (cfg moduleConfig) getReverseProxyDirectorFunc() func(*http.Request) {
 	return func(r *http.Request) {
 		vs := r.URL.Query()
@@ -60,29 +69,29 @@ func (cfg moduleConfig) getReverseProxyDirectorFunc() func(*http.Request) {
 
 func (cfg moduleConfig) getReverseProxyModifyResponseFunc() func(*http.Response) error {
 	return func(resp *http.Response) error {
+		var err error
 		if resp.StatusCode != 200 {
 			return nil
 		}
 
-		var (
-			err  error
-			body bytes.Buffer
-		)
+		oldBody := resp.Body
+		defer oldBody.Close()
 
-		if _, err = body.ReadFrom(resp.Body); err != nil {
-			return &VerifyError{"Failed to read body from proxied server", err}
-		}
-		resp.Body = ioutil.NopCloser(bytes.NewReader(body.Bytes()))
-
-		var bodyReader io.Reader = bytes.NewReader(body.Bytes())
+		var bodyReader io.ReadCloser
 		if resp.Header.Get("Content-Encoding") == "gzip" {
-			bodyReader, err = gzip.NewReader(bodyReader)
+			bodyReader, err = gzip.NewReader(oldBody)
 			if err != nil {
 				return &VerifyError{"Failed to decode gzipped response", err}
 			}
+		} else {
+			bodyReader = ioutil.NopCloser(oldBody)
 		}
+		defer bodyReader.Close()
 
-		dec := expfmt.NewDecoder(bodyReader, expfmt.ResponseFormat(resp.Header))
+		contentType := expfmt.ResponseFormat(resp.Header)
+		dec := expfmt.NewDecoder(bodyReader, contentType)
+
+		mfs := []*dto.MetricFamily{}
 		for {
 			mf := dto.MetricFamily{}
 			err := dec.Decode(&mf)
@@ -93,7 +102,32 @@ func (cfg moduleConfig) getReverseProxyModifyResponseFunc() func(*http.Response)
 				proxyMalformedCount.WithLabelValues(cfg.name).Inc()
 				return &VerifyError{"Failed to decode metrics from proxied server", err}
 			}
+
+			mfs = append(mfs, &mf)
 		}
+
+		newBody, newBodyWriterPipe := io.Pipe()
+		resp.Body = newBody
+
+		var newBodyWriter io.WriteCloser
+		if resp.Header.Get("Content-Encoding") == "gzip" {
+			newBodyWriter = gzip.NewWriter(newBodyWriterPipe)
+		} else {
+			newBodyWriter = NopWriteCloser(newBodyWriterPipe)
+		}
+
+		enc := expfmt.NewEncoder(newBodyWriter, contentType)
+
+		go func() {
+			defer newBodyWriterPipe.Close()
+			defer newBodyWriter.Close()
+			for _, mf := range mfs {
+				if err := enc.Encode(mf); err != nil {
+					log.Errorf("Encoding of response failed: %v", err)
+					return
+				}
+			}
+		}()
 
 		return nil
 	}
